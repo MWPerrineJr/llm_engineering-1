@@ -125,3 +125,196 @@ PyMuPDF confirmed as the loader. Fixes made in `clean_page`, all found by inspec
 - [ ] **Next: Step 2, Supabase schema SQL** (vector extension, `documents` table vector(1536), HNSW index, `match_documents`)
 - [ ] Step 5: embed + upsert in batches (~1,294 chunks, ~$0.08)
 - [ ] Step 6: retrieval sanity test
+
+## Session 3 — 2026-11-01
+
+### Notebook tidy: done ✅
+- Empty cells deleted. The PUA / no-section diagnostic was kept as a regression check (it now prints 0 and an empty Counter).
+- The two duplicate stats cells were replaced by `chunk_report(chunks, label, show=True)`, which returns a per-chunk DataFrame (`library, chars, tokens, strategy`). It is called as `page_df = chunk_report(page_chunks, "page-level")` and `section_df = chunk_report(chunks, "section-level")`.
+- New comparison cell, `def summarize(df):`, with a side-by-side table and an overlaid histogram ("Effect of merging pages into section runs").
+  - Fixed bins (`size=50`, 0–2,000) on every histogram, so differences reflect the data rather than different bin edges.
+  - Each row is rounded inside `summarize`, not with a table-wide `.round(1)` (that made both costs show as $0.1).
+  - Bug fixed: `return df` was inside `if show:`, so `show=False` returned None.
+- Results are unchanged: 1,652 vs 1,294 chunks, std dev 627 vs 362, cost $0.079 vs $0.082.
+
+### chunk_id fix ✅
+- Both strategies used to number from 0, so IDs collided (which would break an upsert keyed on chunk_id).
+- Now `f"{library}-p{i:04d}"` (page-level) and `f"{library}-s{i:04d}"` (section-level).
+- New cell `# --- Sanity check: chunk_ids are unique across both strategies ---` asserts uniqueness and prints `matplotlib-p0000 matplotlib-s0000`.
+
+**Lesson:** `page_chunks = chunks` binds a second name to the same list; it does not copy it. The assert failed because the Join cell hadn't been rerun after the Trim cell, so both names pointed to the page-level list. Always Restart & Run All (and save) before any step that writes data.
+
+### Supabase findings (read-only)
+- Project: **data-science-rag** (`qrerekdrynpjzaqxokbj`, us-east-2, Postgres 17).
+- `vector` 0.8.2 is installed in the **public** schema (so use `vector(1536)`, not `extensions.vector`). 0.8 supports iterative index scans for filtered queries.
+- `public.documents` already exists with the LangChain default shape: `id bigint` (sequence), `content`, `metadata jsonb`, `embedding vector`, RLS on, **0 rows**.
+- Still unknown: the embedding dimension, whether `match_documents` exists, and whether there's an HNSW index.
+
+### Open items (pick up here next session)
+- [x] Tidy notebook
+- [x] Supabase check: which project holds `documents`
+- [x] Step 2: `documents` recreated; schema, HNSW index and `match_documents` applied (see below)
+- [x] Step 5: embed + upsert (see below)
+
+### Step 2: Supabase schema ✅
+Decision: **drop and recreate** `documents`. The old LangChain default (`id bigint` sequence) couldn't hold string chunk_ids, so re-runs would have duplicated rows. It was empty, so nothing was lost.
+
+| Object | Definition |
+|---|---|
+| `id` | `text` primary key, = `chunk_id` (makes upserts idempotent; matches LangChain's `ids=` argument) |
+| `content`, `metadata` | `text not null`, `jsonb not null` |
+| `embedding` | `vector(1536) not null` (`vector` 0.8.2 lives in `public`) |
+| `library` | `text generated always as (metadata->>'library') stored`, btree-indexed |
+| `documents_embedding_hnsw` | `hnsw (embedding vector_cosine_ops)` |
+| `match_documents(query_embedding, match_count=5, filter jsonb='{}')` | returns `id, content, metadata, similarity`, filters with `metadata @> filter` (LangChain-compatible signature) |
+| RLS | on (ingestion uses the service-role key) |
+
+**Error and fix:** `42P13 cannot change return type of existing function`. An older `match_documents` returned `id bigint`, and `create or replace` can't change OUT columns. Fixed by adding `drop function if exists public.match_documents(vector, integer, jsonb);` first. To list overloads: `select oid::regprocedure from pg_proc where proname = 'match_documents';`
+
+### Step 5: embed + upsert ✅
+- `OpenAIEmbeddings(model="text-embedding-3-large", dimensions=1536)`. The smoke test returned length 1536 with norm 1.0.
+- `upsert_chunks(chunk_list, strategy)` runs in batches of 100, adds `metadata["strategy"]`, and upserts on `id`. 13 batches took 24 s.
+- Loaded **section-level only** (`strategy="section"`). Page-level comes later with `upsert_chunks(page_chunks, "page")`, compared via `filter={"strategy": ...}` at Step 9.
+
+| library | rows | sections |
+|---|---|---|
+| matplotlib | 161 | 33 |
+| numpy | 171 | 22 |
+| pandas | 249 | 21 |
+| plotly | 183 | 37 |
+| scikit-learn | 334 | 31 |
+| scipy | 196 | 26 |
+| **total** | **1,294** | **170** |
+
+All vectors are 1536-dim with average norm 1.000. The counts match `section_df` exactly (verified in the notebook and with SQL).
+
+**Lessons**
+- `PGRST125 Invalid path specified in request URL`: `SUPABASE_URL` must be the bare `https://<ref>.supabase.co`, with no trailing `/` and no `/rest/v1`.
+- PostgREST returns at most **1,000 rows** by default. `res.count` (with `count="exact"`) is exact, but `res.data` is truncated (it showed scipy = 2). Count per library on the server with `select("id", count="exact", head=True).eq("library", lib)`.
+- Unsaved notebook ≠ what happened. Save before reviewing.
+
+### Open items (pick up here next session)
+- [ ] **Next: Step 6, retrieval sanity test.** `retrieve(question, k=5, **filters)` calling the `match_documents` RPC, with 5 probe questions plus a filtered plotly call. Check top-1 library, section sense, the sim gap from rank 1 to 5, and that filtered queries still return k rows
+- [ ] Step 7: t-SNE embedding visualization (plotly, colored by library)
+- [ ] Step 8: RAG chain with Pydantic structured output (`answer`, `sources`)
+- [ ] Step 9: evaluation, hit rate@k and MRR; load `page_chunks` as `strategy="page"` for the baseline
+- [ ] Step 10: Streamlit app (chat, citations, library filter)
+
+### Step 6: retrieval sanity test ✅
+`retrieve(question, k=5, **filters)` calls the `match_documents` RPC with `filter={"strategy": "section", **filters}`.
+
+**The first run exposed an ingestion bug: section names split by casing.** Chapter openers keep their original title ("Reshaping and pivot tables"), while running headers are uppercase and passed through `.title()` ("Reshaping And Pivot Tables"). `groupby` treated them as different keys, so **every chapter's opening page became its own one-page section run**, cut off from its content.
+
+Fix: a new cell after the load/clean cell, `# --- Canonicalize section names ... ---`. It groups by `(library, section.casefold())` and keeps the variant that isn't plain `.title()` output (the opener's wording, which also restores `scipy.optimize`). 69 sections had mixed casing.
+
+| | Before | After |
+|---|---|---|
+| Section runs | 170 | **101** |
+| Section-level chunks | 1,294 | **1,264** |
+| Chunks < 1,600 chars | 9.6% | **5.9%** |
+| Std dev chars | 362 | **269** |
+| Tokens / cost | 632,452 / $0.082 | 633,383 / $0.082 |
+
+Reloaded with delete-then-upsert in the upsert cell:
+    supabase.table(TABLE_NAME).delete().eq("metadata->>strategy", "section").execute()
+    upsert_chunks(chunks, "section")
+SQL check: 1,264 rows, 1,264 distinct ids, 101 sections (the same count when case-insensitive), no stale rows.
+Per library: matplotlib 155, numpy 167, pandas 246, plotly 179, scikit-learn 325, scipy 192.
+
+**Scorecard (after the fix)**
+| Probe | Top-1 | Right library in top 5 | Sim @1 → @5 |
+|---|---|---|---|
+| Pivot long → wide | pandas · Reshaping and pivot tables (100–111) | 5/5 | 0.587 → 0.482 |
+| Tune hyperparameters with CV | scikit-learn · Cross-validation (58–72) | 5/5 | 0.622 → 0.521 |
+| Minimize with constraints | scipy · Optimization (scipy.optimize) (5–35) | 5/5 | 0.561 → 0.529 |
+| Broadcast arrays | numpy · Broadcasting (62–67) | 5/5 | 0.682 → 0.541 |
+| Secondary y-axis (ambiguous) | mixed plotly / matplotlib | — | 0.464 → 0.448 (flat) |
+| Same question, `library="plotly"` | plotly only, 5 rows | ✓ | 0.476 → 0.447 |
+
+- Clear questions score about 0.56–0.68 at rank 1, and the ambiguous one stays flat around 0.45. A cutoff around 0.5 could drive a "not confident" answer at Step 8; tune it at Step 9. The PDFs may not cover `twinx` / `secondary_y` directly (a knowledge-base gap).
+- The filter returns all k rows, so post-filtering after the HNSW search isn't losing results at this scale.
+- The same chunk scored 0.467 vs 0.485 across two `embed_query` calls (OpenAI embeddings aren't exactly deterministic). **At Step 9, embed each eval question once and reuse it.**
+- Single-query score shifts after re-chunking are noise; judge chunking changes with hit rate@k / MRR.
+
+**Lessons**
+- Inspecting retrieval output (section names plus page ranges) found an ingestion bug that the chunk-length stats didn't show. Look at real results, not just aggregates.
+- An upsert never deletes. When chunk ids can change, delete by `strategy` first so stale rows don't linger.
+
+### Open items (supersedes the list above)
+- [x] Step 6: retrieval sanity test, and the section-casing fix
+- [ ] **Next: Step 7, t-SNE.** Fetch embeddings paged past the 1,000-row cap (`.range()`), `json.loads` each vector (pgvector returns a string), `TSNE(metric="cosine", perplexity=30, init="pca", random_state=42)`, plotly colored by library with section/id hover. Try perplexity 15 and 50
+- [ ] Step 8: RAG chain with Pydantic structured output (`answer`, `sources`) plus a low-confidence cutoff
+- [ ] Step 9: evaluation, hit rate@k and MRR; load `page_chunks` as `strategy="page"` for the baseline; embed questions once
+- [ ] Step 10: Streamlit app (chat, citations, library filter)
+
+### Step 7: t-SNE visualization ✅
+- Embeddings are fetched from Supabase in pages (`.range(start, start+999)`) to get past the 1,000-row cap. Each vector goes through `json.loads`, because pgvector comes back as a string.
+- `plot_tsne(X, meta, dims=2|3, perplexity=30, seed=42)` uses cosine t-SNE with `init="pca"`, plotly colored by library, hover showing section and id, and returns the coordinates. 2D and 3D need separate fits (3D is the Barnes-Hut maximum).
+- **10-NN same-library rate on the t-SNE layout: 0.975 (both 2D and 3D).** scikit-learn 1.000, pandas 0.99, plotly 0.97, scipy 0.96, matplotlib 0.95, numpy 0.95.
+- Overlap pairs: **matplotlib ↔ plotly** and **numpy ↔ scipy** (consistent in 2D and 3D, so real rather than a projection artifact). The outliers are mostly `API quick reference` chunks (signature lists look alike across libraries).
+- t-SNE keeps local neighborhoods, not distances between clusters. For a check in the real geometry, use `NearestNeighbors(metric="cosine")` on `X`.
+
+### Ingestion fixes found via t-SNE and eval prep ✅
+1. **TOC continuation pages.** The `Contents` filter only caught pages *starting* with "Contents". Each table of contents runs onto a second page with "CONTENTS" as the running header, so it got parsed as section `Contents`: 19 dot-leader chunks. Fix: drop `section.casefold() == "contents"` after canonicalizing. Dropped 10 pages (matplotlib 2, numpy 1, pandas 2, plotly 2, scikit-learn 2, scipy 1).
+   - **Bug on the way:** `.casefold != "contents"` (missing `()`) compares a method object to a string, which is always True, so nothing was dropped and no error was raised. It was caught only because the drop-count print showed `{}`.
+2. **Hyphenation and spacing splits.** `rc- Params` / `Rcparams`, `(ufunc) basics` / `(Ufunc)Basics`, `prac- tices` / `Practices`. Fix: match on `section_key(s) = re.sub(r"[^a-z0-9]", "", s.casefold())` and rejoin line-break hyphens with `re.sub(r"(\w)- (\w)", r"\1\2", name)`. 72 variant spellings merged.
+- Also: rerunning a single cell isn't a fresh run. The canonicalize cell printed `0 sections had mixed casing` because it ran on already-fixed `docs`. Restart & Run All.
+
+**Current data (notebook and Supabase agree)**
+| | Value |
+|---|---|
+| Pages | 1,030 |
+| Section runs | **92** |
+| Section-level chunks (`strategy="section"`) | **1,243** (matplotlib 151, numpy 164, pandas 243, plotly 174, scikit-learn 321, scipy 190) |
+| Page-level chunks (`strategy="page"`) | **1,631** |
+| `Contents` / dot-leader / hyphen-broken rows | 0 / 0 / 0 |
+| Distinct sections (normalized = raw) | 92 = 92 for both strategies |
+
+### Step 8: RAG chain ✅
+- `Answer(BaseModel)`: `answer: str`, `cited: list[int]` via `ChatOpenAI(model=MODEL).with_structured_output(Answer)`.
+- **The LLM cites block numbers only; citations (library, version, section, pages, url, sim) are built in code from Supabase metadata**, so it can't invent pages or URLs.
+- Confidence gate **before** the LLM: if top-1 sim < `MIN_SIM`, return "not confident" without a model call.
+- `dedupe` uses `setdefault` to keep the *first* (best-scoring) chunk per section. A dict comprehension kept the last one (0.487 instead of 0.579).
+- **`gpt-6-luna` rejects `temperature=0`** (only the default of 1 is supported). Answers aren't deterministic, so grade answer quality over several runs or from saved outputs. Retrieval metrics don't involve the LLM.
+- Smoke test: pivot answered correctly with a citation (pandas · Reshaping and pivot tables, 100–111). Secondary y-axis (0.459) and capital of France (0.10) were refused at a cutoff of 0.50.
+- Known limitation: citation pages cover the whole section run (e.g. API quick reference 149–220). Future fix: `add_start_index=True`, then map the offset to a page.
+
+### Step 9: evaluation, first run ✅
+48 questions (43 answerable with an expected `(library, section)`, 5 out-of-scope). Each is embedded once (`embed_documents`) and reused across strategies.
+
+| Metric | page (1,631) | section (1,243) |
+|---|---|---|
+| hit@1 | **0.884** (38/43) | 0.837 (36/43) |
+| hit@3 | **0.953** | 0.930 |
+| hit@5 | 1.000 | 1.000 |
+| hit@10 | 1.000 | 1.000 |
+| MRR | **0.922** | 0.892 |
+| library@1 | 0.953 | **0.977** |
+
+- **The difference is 2 questions at hit@1, which is within noise for n=43** (1 question ≈ 2.3 pts). Page-level also has more chunks per section ("more lottery tickets") under a section-label metric, and the metric doesn't measure how complete the retrieved context is, which is the reason section-level chunking exists. Not decided yet; needs a paired comparison and answer-quality grading.
+- Section-level misses at rank > 3: KD-tree nearest neighbors (rank 5), subplot labels overlapping (rank 4), dark theme for all figures (rank 4, top-1 = matplotlib). The dark-theme question doesn't name plotly, and matplotlib's style sheets answer it too, so it's a labeling ambiguity rather than a retrieval failure.
+
+**Confidence cutoff (section strategy)**
+| cutoff | answerable kept | unanswerable rejected |
+|---|---|---|
+| 0.35 | 1.000 | 0.8 |
+| **0.40** | **1.000** | **1.0** |
+| 0.45 | 0.953 | 1.0 |
+| 0.50 | 0.837 | 1.0 |
+| 0.55 | 0.581 | 1.0 |
+
+- **Set `MIN_SIM = 0.40`.** The original 0.50 would have refused 16% of answerable questions. The margin is thin (one unanswerable question scores between 0.35 and 0.40), and it rests on only 5 unanswerable questions; add more.
+
+**Lessons**
+- Bugs that raise no error (`.casefold` without parentheses) are caught only by printing what a filter removed.
+- Eval labels must be unambiguous: a question that doesn't name a library can be correctly answered by another library.
+- Small eval sets: read the misses before trusting differences of a few points.
+- `groupby(...).apply(metrics)` raises a pandas FutureWarning. Pass `include_groups=False`.
+
+### Open items (supersedes the lists above)
+- [x] Steps 1–8, Step 9 first run
+- [ ] Set `MIN_SIM = 0.40` in the RAG chain cell
+- [ ] Step 9b: relabel or reword ambiguous questions (dark theme → "in Plotly"), add ~10 questions in your own words and ~10 more out-of-scope ones, run a paired page-vs-section comparison (per-question rank diff), and grade answer quality with LLM-as-judge over 2–3 runs
+- [ ] Decide on a chunking strategy from 9b
+- [ ] Optional: per-chunk page citations (`add_start_index=True`)
+- [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
