@@ -318,3 +318,54 @@ Per library: matplotlib 155, numpy 167, pandas 246, plotly 179, scikit-learn 325
 - [ ] Decide on a chunking strategy from 9b
 - [ ] Optional: per-chunk page citations (`add_start_index=True`)
 - [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
+
+## Session 4 — 2026-11-08
+
+### MIN_SIM ✅
+- `MIN_SIM = 0.40` in the RAG chain cell (was 0.50). The Step 8 markdown cell still says 0.50, so update the text.
+
+### Step 9b: eval set v2 ✅
+- 71 questions: 56 answerable (43 + 13 new in casual phrasing, aimed at sections not covered yet) and 15 out-of-scope (5 + 10 new **near-misses**: XGBoost, Dask, seaborn, statsmodels, Polars, Dash, Prophet, PyTorch GPU, SQL window, git).
+- **Multi-label targets** (Option 2): `ALSO` dict → `eval_df["targets"]` = list of acceptable (library, section) pairs; hit = any target in the top k; library@1 checks against the target libraries. 5 multi-label questions: dark theme (+matplotlib rcParams), PNG export (+matplotlib Intro to Figures), Ax = b (+numpy API), NaN before training (+pandas missing data), subplot overlap (+plotly Subplots).
+- Label assert: every target must exist in `chunks` metadata. It caught `Analyzing` vs the PDF's **`Analysing one sample`**.
+- `pd.concat(..., ignore_index=True)`; the groupby selects columns explicitly (FutureWarning gone).
+
+| Metric | page | section |
+|---|---|---|
+| hit@1 | 0.839 (47/56) | 0.804 (45/56) |
+| hit@3 | 0.946 | 0.964 |
+| hit@5 / @10 | 1.000 | 1.000 |
+| MRR | 0.897 | 0.880 |
+| library@1 | 0.964 | 0.964 |
+
+- All 13 casual questions are within the top 3 (section). The only rank > 3 misses: KD-tree (5, top = scipy API quick reference) and subplot overlap (4, top = Text in Matplotlib).
+
+### Paired page vs section ✅
+- Ranks per question (miss = 11): **44 ties, 6 page better, 6 section better; Wilcoxon p = 0.69 (n = 12).**
+- **Retrieval doesn't distinguish the strategies.** Decide chunking on answer quality (completeness of context), not hit rate.
+
+### Confidence gate with near-misses
+| cutoff | answerable kept | out-of-scope rejected |
+|---|---|---|
+| 0.35 | 1.000 | 0.467 |
+| **0.40** | **1.000** | **0.733** |
+| 0.45 | 0.929 | 0.800 |
+| 0.50 | 0.804 | 0.867 |
+| 0.55 | 0.518 | 1.000 |
+
+- Leaks at 0.40: XGBoost early stopping 0.530 (→ sklearn Ensembles), Dask groupby 0.515 (→ pandas Group by), seaborn pairplot 0.471 (→ plotly Express), statsmodels OLS p-values 0.421 (→ scipy API).
+- **The distributions overlap; no similarity cutoff separates them** (0 leaks costs 48% of answerable questions). Keep 0.40 as a cheap first filter.
+- The 0.45 row moved 0.946 → 0.929 between identical runs (re-embedding is nondeterministic). Cache the question vectors to disk for stable comparisons.
+
+**Lessons**
+- Easy out-of-scope questions (capital of France) made the gate look perfect. Near-misses are the real test.
+- When pasting a replacement, paste *over* the old lines. The leftover old 3 lines silently rebuilt `eval_df` without `targets`; it only failed one cell later.
+- A label typo is a silent miss, not an error. Assert labels against the data.
+
+### Open items (supersedes the lists above)
+- [ ] Update the Step 8 markdown cell to 0.40; delete the empty cell after the paired-comparison cell
+- [ ] Cache `eval_df` question vectors (e.g. parquet/npy) so reruns don't re-embed
+- [ ] **Next: second layer of refusal.** Add `in_context: bool` to `Answer`; the LLM sets it False when the blocks don't answer the question. Test on the 4 leaks plus all answerable questions
+- [ ] LLM-as-judge (2–3 runs): faithfulness, completeness, correct refusal, page vs section → decide chunking
+- [ ] Optional: per-chunk page citations (`add_start_index=True`)
+- [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
