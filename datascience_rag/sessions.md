@@ -369,3 +369,85 @@ Per library: matplotlib 155, numpy 167, pandas 246, plotly 179, scikit-learn 325
 - [ ] LLM-as-judge (2–3 runs): faithfulness, completeness, correct refusal, page vs section → decide chunking
 - [ ] Optional: per-chunk page citations (`add_start_index=True`)
 - [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
+
+## Session 4b — 2026-11-08 (afternoon)
+
+### Second refusal layer: `in_context` ✅
+- `Answer` now has `in_context: bool` as its **first** field, so the model decides whether the context covers the question before it writes an answer. `cited` is empty when the field is False.
+- The system prompt says each block is labeled with its library, and if the question asks about a library or tool none of the blocks come from, set `in_context=False` instead of answering with a different library's equivalent. **The leak libraries are deliberately not named in the prompt**, so the prompt isn't fitted to the eval set.
+- `ask()` returns `refused_by` = `"gate"` | `"llm"` | `None`, plus `llm_note` (the model's explanation) when the LLM refuses.
+- `search()`/`ask()` accept `qv=` to reuse cached question vectors (`eval_df.qv`), so eval runs don't re-embed.
+- Bug: the rpc key was typed `query_embeddings` (plural) → PGRST202 "function not found in schema cache". PostgREST finds a function by its argument names, so the key must be `query_embedding`.
+
+### Results (full eval set, section strategy, cached vectors)
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Answerable answered | 56/56 | 56/56 | 56/56 |
+| Out-of-scope refused | 15/15 | 15/15 (gate 11, LLM 4) | 15/15 (gate 11, LLM 4) |
+| Cost | — | $0.0224 | $0.0225 |
+
+- The LLM layer caught all 4 leaks (XGBoost, Dask, seaborn, statsmodels) with **0 false refusals**. With the gate alone at 0.40, the rejection rate was 0.733.
+- Caveat: 0/15 leaks still allows a true leak rate of up to about 20% (the rule of three, 95%). Add more near-miss questions before relying on it.
+
+### Cost tracking ✅
+- `with_structured_output(Answer, include_raw=True)` → `res["raw"].usage_metadata`; `llm_cost()` uses a `PRICES` dict (gpt-6-luna $0.10 in / $0.01 cached / $0.50 out per 1M; check against OpenAI's pricing page). Gate refusals cost $0 (`NO_USAGE`).
+- Run 2: 60 LLM calls out of 71 questions (the gate skipped 11), 172,541 in / 10,361 out tokens, **$0.0224 total, $0.000374 per call, $0.37 per 1,000 questions.**
+- Answers: about 2,874 in / 181 out tokens. LLM refusals: about 2,899 in / 61 out.
+
+**Lessons**
+- A typo in an rpc argument name doesn't give a "bad argument" error; it gives "function not found". Read the error's `hint`.
+- Save the notebook (Cmd+S) before asking Claude to read outputs. The file on disk lags behind the kernel.
+
+### Open items (supersedes the lists above)
+- [x] Third stability run: identical decisions 3/3 (input tokens identical, so retrieval with cached vectors is deterministic; output tokens 10,361 → 10,522)
+- [ ] Prompt: stop putting block numbers (`[1, 4]`) in the answer text (they're already in `cited`)
+- [ ] Cache `eval_df` question vectors to disk (parquet/npy) so they survive a kernel restart
+- [ ] **Next: LLM-as-judge, page vs section.** Generate answers for the 56 answerable questions with both strategies (`ask(q, strategy='page')`); have `ask()` also return its context; judge with a stronger model (GPT-6 Sol) to avoid self-preference bias; hide the strategy and randomize A/B order (position bias); score faithfulness, completeness (1–5) and a pairwise preference; report win/tie/loss, a sign test, and quality per $. Run 2–3 times. Estimated $0.80–$1 per run.
+- [ ] More near-miss out-of-scope questions (to tighten the leak-rate bound)
+- [ ] Optional: per-chunk page citations (`add_start_index=True`)
+- [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
+
+## Session 4c — 2026-11-08 (evening)
+
+### Small fixes ✅
+- `ask()` returns `context` (None for gate refusals) so the judge can check faithfulness. The first paste left the new returns *under* the old ones, where they were dead code. Fixed by replacing them.
+- `llm_cost` key fixed: `cache_read` (it was `cached_read`, so cached tokens were billed at the full input price).
+- Prompt: "don't answer with a different library's equivalent" restored, and block numbers are now kept out of the answer text (they go only in `cited`). The smoke test confirms no `[1, 4]` in answers.
+- Still to fix: `answer` description says "In in_context" (should be "If"), and there's a stray `"` in the `cited` description.
+
+### Step 9d: LLM-as-judge, page vs section ✅
+- 9d-1: answer all 56 answerable questions with both strategies (`ask(q, qv=..., strategy=...)`). 0 refusals under either strategy.
+- 9d-2: judge `gpt-6-sol` (stronger than `gpt-6-luna`, which wrote the answers, to avoid self-preference bias). It's **blind** to the strategy, with the **A/B order randomized** per question (`np.random.default_rng(42 + run)`). `Judgment` puts `reason` first, then faithful_a/b (checked against *each answer's own* context), complete_a/b (1–5), and preferred A/B/tie.
+- 9d-3: majority vote over 3 runs, sign test (ties dropped), quality means, position-bias and consistency checks. 9d-4: lists unfaithful answers, plus a swap × preferred crosstab.
+- Judge cost: $2.02 for 3 runs (168 judgments, about $0.012 each). The cached price for Sol is set equal to its input price until verified.
+
+| | page | section |
+|---|---|---|
+| Majority wins (33 ties) | **14** | 9 |
+| Wins across all 168 judgments | **47** | 29 |
+| Faithful | **0.970** | 0.952 |
+| Completeness (1–5) | **4.76** | 4.66 |
+| Input tokens per 56 answers | **131K** | 162K (+23%) |
+
+- Sign test p = 0.405 (n = 23): **not significant**, but page is never behind on any measure. (Run 0 alone: 17–11 for page, p = 0.345.)
+- **No position bias:** when page was in slot A it won 20–15; when page was in slot B it won 27–14. Overall A 34 / B 42. The judge follows the strategy, not the slot.
+- The judge is noisy: the same winner in all 3 runs for 62.5% of questions. **Caveat:** 9d-1 was re-run after run 0, so run 0 judged different answers than runs 1–2. The 62.5% mixes judge variability with answer variability.
+- **Faithfulness flags (12 of 336) are almost all *correct but ungrounded* facts**, where the model filled gaps from its training: `best_params_`, `font.size`, `jac` optional in SLSQP constraints, `RdBu_r`, ridge = L2. The one genuinely weak answer: integer-array indexing (under both strategies).
+
+### Decision: **page-level chunking** ✅
+- Retrieval tied (Session 4: Wilcoxon p = 0.69) and answer quality tied (p = 0.405, with page slightly ahead). Page uses about 19% fewer input tokens per answer and is simpler (no section merging). Section chunking's intended benefit, more complete context, didn't show up in either retrieval or answers.
+
+**Lessons**
+- **Prompt caching changes costs between runs.** The second generation hit the cache: same input tokens, but the cost went from $0.0175 to $0.0062. Compare strategies on **token counts**, not dollars; the first-run cost is the realistic per-query figure.
+- Re-running an upstream cell (9d-1) silently changes what later "runs" are measuring. Freeze the inputs (save them to disk) before doing repeated judge runs.
+- Faithfulness and correctness are different things. A strict judge flags correct facts that aren't in the context. Decide whether that's acceptable for the product.
+
+### Open items (supersedes the lists above)
+- [ ] Save `gen` and `judged` to parquet so the $2 judge run never has to be repeated
+- [ ] Switch `search()`/`ask()` default from `'section'` to `'page'`; re-run the two-layer refusal check on page (0.40 was tuned on section top-1 sims, so re-check the cutoff sweep for page)
+- [ ] Fix the two description typos in `Answer`
+- [ ] Optional: tighten the prompt against outside knowledge ("if a detail isn't in the blocks, leave it out") and re-judge faithfulness only
+- [ ] Optional: the integer-array indexing answer is weak under both strategies, so check whether the PDF covers the single-index-array case
+- [ ] Cache `eval_df` question vectors to disk
+- [ ] More near-miss out-of-scope questions
+- [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
