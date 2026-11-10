@@ -451,3 +451,164 @@ Per library: matplotlib 155, numpy 167, pandas 246, plotly 179, scikit-learn 325
 - [ ] Cache `eval_df` question vectors to disk
 - [ ] More near-miss out-of-scope questions
 - [ ] Step 10: Streamlit app (chat, citations, library filter, "not confident" state)
+
+## Session 5 — 2026-11-09
+
+### Switch to page-level chunks ✅
+- `search()` default filter is now `{'strategy': 'page', **filters}`. `ask()` inherits it; the eval and judge cells still pass `strategy=` explicitly.
+- `cite()` fix: page chunks have no `page_end`, so the old line printed `12-None`. Now `end = m.get('page_end', m['page'])`, then `pages = str(m['page']) if m['page'] == end else f'{m["page"]}-{end}'`. Smoke test shows single pages (pivot → `100`).
+- `Answer` typos fixed: the prompt said `set if_context to False` (the field is `in_context`), the `answer` description said "In in_context", and the `cited` description had a stray `"`.
+- **New page-level win:** "secondary y-axis" is now answered correctly with `twinx()` (matplotlib · Quick start guide p. 13, sim 0.56–0.62). Under section chunking it scored 0.456 and gave a vague plotly answer: a small page chunk matched better than a large section chunk where the passage was diluted.
+
+### 9d cells made rerun-safe ✅
+- Cause: Restart & Run All raised `NameError: judged` in 9d-3, which concatenated runs 1–2 onto a `judged` that only existed in last night's kernel. Run All had also re-run 9d-1 (6 min, ~$0.02, new answers).
+- `RERUN_JUDGE = False` at the top of 9d-1. When False, 9d-1 loads `judge_answers.parquet` and 9d-3 loads `judge_results.parquet`. When True, 9d-1 saves `gen` **before** judging (inputs frozen), and 9d-3 runs `range(3)` and saves `judged`.
+- The standalone save cell was deleted (it would overwrite the results on every Run All).
+- Fresh-kernel check: 131,062 / 161,560 tokens; 14 / 9 / 33; p = 0.405; judge $2.015.
+- ⚠️ `judge_answers.parquet` was rewritten at 11:09 (407,106 → 405,654 bytes), most likely by the old save cell with this morning's regenerated answers. `judge_results.parquet` is intact (168 rows, 3 runs). Input tokens still match, so retrieval is identical and only the LLM wording differs. The page-level decision stands, but answers read from `gen` may differ slightly from the ones the judge graded.
+
+### Refusal layers on page chunks ✅
+**Cutoff sweep (page / section)**
+| cutoff | answerable kept | out-of-scope rejected |
+|---|---|---|
+| 0.35 | 1.000 / 1.000 | 0.400 / 0.467 |
+| **0.40** | **1.000 / 1.000** | **0.667 / 0.733** |
+| 0.45 | 0.946 / 0.929 | 0.733 / 0.800 |
+| 0.50 | 0.821 / 0.804 | 0.867 / 0.867 |
+
+- **Keep `MIN_SIM = 0.40`.** The gate passes one more near-miss on page chunks, so the LLM layer carries more weight.
+- With the old prompt, one leak on page chunks: **statsmodels OLS p-values**, answered 5/5 times. The model wrote "The context does not specify the OLS API…" but still set `in_context=True`. Root cause confirmed: the retrieved scikit-learn *Linear models* page **mentions statsmodels by name** (`statsmodels named in context: True`), and the model treated the mention as coverage.
+- Fix: `in_context` description now adds "…even when the blocks discuss something similar **or only mention it by name**. **If your answer would have to say the context doesn't show how, set False.**" Leak libraries are still not named in the prompt.
+
+| Page chunks | Old prompt | **Stricter `in_context`** |
+|---|---|---|
+| Answerable answered | 56/56 | **56/56** (0 false refusals) |
+| Out-of-scope refused | 14/15 | **15/15** (gate 10, LLM 5) |
+| OLS re-asked 5× | `None`×5 | **`llm`×5** |
+| Cost per 1,000 questions | $0.31 | $0.32 |
+
+- Gate passes on page chunks: XGBoost 0.529, Dask 0.509, OLS 0.474, seaborn 0.469, SQLAlchemy 0.421. The LLM catches all five.
+- Caveat unchanged: 0/15 leaks still allows a true leak rate up to ~20% (rule of three).
+- Cutoff sweep cell now plots `strategy == "page"` and the table compares both strategies.
+
+**Lessons**
+- **Indentation can silently change control flow.** An `else:` indented under a `for` loop became a for–else, so with `RERUN_JUDGE = False` the cell did nothing, and it only "worked" because `gen` was still in memory.
+- **Run All ≠ Restart & Run All.** Run All keeps old variables, which hides missing-variable bugs. Verify on a fresh kernel.
+- **A standalone save cell is a trap.** Put saves inside the branch that produces new results.
+- **A passing mention is not coverage.** A doc that names a library (scikit-learn pointing to statsmodels) can fool a coverage check. Inspect the context, not only the answer.
+- Restart & Run All also re-runs the Supabase upserts (~$0.08) and re-embeds the eval questions, so similarity scores shift slightly between runs.
+
+### Open items (supersedes the lists above)
+- [x] Switch default to page; fix `cite()` and the `Answer` typos
+- [x] 9d cells load from parquet (`RERUN_JUDGE`); save cell removed
+- [x] Page-level refusal check; stricter `in_context` → 56/56 and 15/15
+- [ ] **Next: fill `source_url` for page chunks.** Build a `(library, section) → source_url` map from opener pages, apply it to `page_chunks`, re-upsert `strategy="page"` (delete first). Most page citations currently show `url: None`
+- [ ] Cache eval question vectors to disk (`eval_vectors.parquet`), loaded when present
+- [ ] Put the upsert cells behind an `UPSERT = False` flag
+- [ ] Add the secondary y-axis question to the eval set
+- [ ] More near-miss out-of-scope questions (tighten the leak-rate bound)
+- [ ] Optional: tighten the prompt against outside knowledge; re-judge faithfulness only
+- [ ] Optional: per-chunk page citations (`add_start_index=True`) — less needed now that page chunks cite single pages
+- [ ] Step 10: Streamlit app (`rag.py` module + `app.py`; chat, citation cards, library filter, "not confident" state)
+
+## Session 5b — 2026-11-09 (evening, logged 2026-11-10)
+
+### Done after the Session 5 log was written ✅
+- **`source_url` for page chunks.** New cell `# --- Fill source_url across each section ...` builds a `(library, section) → first URL` map from opener pages and fills it in on every page of that section. **74 / 92 sections have a URL; 649 pages filled; 723 / 1,030 pages now carry a URL** (was 74). No section had more than one URL.
+  - The 18 sections without one are expected: `API quick reference`, `About this reference`, and the title page (`Matplotlib`, `NumPy`, ...) for each of the 6 libraries. These have no chapter opener and therefore no `Source:` line.
+  - Supabase re-upserted: the smoke-test citations now show URLs (pivot → pandas p. 100, twinx → matplotlib p. 13).
+- **`UPSERT = False` flag** in the upsert cell guards both the section and page upserts (delete-then-upsert when True). `check_rows(strategy, expected)` prints Supabase vs notebook counts: section 1,243 ✅, page 1,631 ✅.
+- **Eval question vectors cached** in `QV_CACHE = Path('eval_vectors.parquet')`: loaded when present, new questions embedded and appended. Delete the file to force a re-embed. The first run embedded 71 and saved them.
+
+### Open items (supersedes the lists above)
+- [ ] **Next:** add the secondary y-axis question to the eval set (target: matplotlib · Quick start guide)
+- [ ] Update the stale `## Next — Step 10` markdown cell (MIN_SIM is pinned at 0.40; twinx is now answered)
+- [ ] More near-miss out-of-scope questions (tighten the ~20% leak-rate bound)
+- [ ] Optional: tighten the prompt against outside knowledge; re-judge faithfulness only
+- [ ] Optional: per-chunk page citations (`add_start_index=True`)
+- [ ] Step 10: Streamlit app: a `rag.py` module (`search`, `ask`, `cite`, `Answer`, prompt, `MIN_SIM`) plus `app.py` (chat, citation cards, library filter, "not confident" state)
+
+## Session 6 — 2026-11-10
+
+### Eval set: secondary y-axis question ✅
+- Added `("How do I add a secondary y-axis to a plot?", "matplotlib", "Quick start guide")` to `EVAL`, with `ALSO` targets matplotlib · API quick reference and plotly · API quick reference. A PDF scan confirmed coverage: matplotlib p. 13 (`twinx`, `secondary_yaxis`) and p. 128; plotly pp. 151–154 (`make_subplots(specs=[[{"secondary_y": True}]])`).
+- Eval set is now **72 questions (57 answerable, 15 out-of-scope)**. The cache worked: `1 newly embedded, 71 from cache`. Label assert passed.
+
+| Metric (n=57) | page | section |
+|---|---|---|
+| hit@1 | **0.842** (48/57) | 0.789 (45/57) |
+| hit@3 | 0.947 | 0.965 |
+| hit@5 / @10 | 1.000 | 1.000 |
+| MRR | **0.899** | 0.873 |
+| library@1 | 0.965 | 0.965 |
+
+- The new question is **rank 1 on page chunks**. On section chunks it is most likely rank 2, consistent with the twinx passage being diluted in a large section chunk. Misses below rank 3 are unchanged: KD-tree (5), subplot overlap (4).
+
+### Markdown cells updated ✅
+- `## Next — Step 10` rewritten (rag.py plan, settled decisions). Step 6 notes the 0.50 → 0.40 change. Step 9 now says 57 answerable / 15 out-of-scope and mentions `ALSO` and the vector cache. Step 8 says "top-5 page chunks".
+
+**Lessons**
+- When pasting from a snippet that shows context lines, paste **only** the new line. Copying the context lines duplicated two eval questions (it would have double-counted them in hit@k/MRR). Checking `len(EVAL)` against the expected count caught it.
+- A dict entry pasted into a list is a syntax error. `ast.parse` on the saved cell catches it before running.
+
+### Open items (supersedes the lists above)
+- [x] Secondary y-axis eval question
+- [x] Stale markdown cells
+- [ ] **Next: Step 10.** `rag.py` module + `app.py` Streamlit chat (plan in progress)
+- [ ] More near-miss out-of-scope questions (tighten the ~20% leak-rate bound)
+- [ ] Optional: tighten the prompt against outside knowledge; re-judge faithfulness only
+- [ ] Optional: per-chunk page citations (`add_start_index=True`)
+
+## Session 6b — 2026-11-10 (Step 10: module, tests, app, deploy, PR)
+
+### Streaming spike ✅
+- Structured output streams when the schema is passed as a **JSON-schema dict** (`Answer.model_json_schema()`, `method="json_schema"`); the Pydantic class only yields the final object.
+- Result: 82 chunks; keys arrive in schema order (`in_context` → `answer` → `cited`); `in_context` at 2.05 s, first text 2.09 s, done 2.89 s. Usage via `stream_usage=True` + `UsageMetadataCallbackHandler`.
+
+### `rag.py` ✅ (214 lines)
+- Same `Answer`, prompt, `MIN_SIM = 0.40`, `cite`, `dedupe`, `llm_cost` as the evaluated notebook cell.
+- Lazy clients (`get_embeddings/get_supabase/get_llm/get_stream_llm`, `lru_cache`); importing makes no network call. `_check_env()` raises a `RuntimeError` naming missing keys. `load_dotenv()` without override.
+- `search(..., strategy="page")`; shared `build_context`, `_gate`, `_finish`.
+- `ask()` (non-streaming, for notebook/eval) and `ask_stream()` yielding `("token", text)` then `("done"|"refused", result)`. Text streams only after `in_context=True`.
+- Smoke test: both paths answered the pivot question ($0.00031 / $0.00029); cited p. 100 vs p. 101 (both in top 5; temperature 1 → compare library/section, not pages, in parity tests). France → gate refusal.
+
+### `tests/test_rag.py` ✅ (11 passed in 1.2 s, no API calls)
+- `cite` formatting, `dedupe` keeps first, gate refuses without touching the LLM (below MIN_SIM / no hits), boundary at exactly MIN_SIM passes, LLM refusal keeps `llm_note`, out-of-range `cited` ignored, stream tokens join to the final answer, stream refusal emits zero tokens, missing env → clear error.
+- Autouse fixture makes every real client factory raise, so an unpatched test fails instead of spending money.
+- Run: `python -m pytest -q -p no:dash tests/` (`-p no:dash` silences Dash's pytest plugin in the course venv).
+
+### `app.py` ✅ (Streamlit, ~130 lines)
+- Spinner over retrieval + first token, then `st.write_stream`; citation cards (library, version, section, page, docs link, similarity); warning + `llm_note` + closest matches for refusals; sidebar library filter (single), "Show details" (refused_by, tokens, cost), session cost, Clear chat.
+- Copies `st.secrets` into `os.environ` (secrets override `.env`). No follow-up memory (each question standalone, matching the eval).
+- Emojis removed from app.py and the notebook's `check_rows` print (course PR rule).
+
+### Security ✅
+- Deployed app uses the **publishable/anon key**; service-role key stays in `.env` for ingestion only.
+- RLS policy applied in the SQL editor: `create policy "Public read access to documentation chunks" on public.documents for select to anon using (true);`
+- Locally tested with `.streamlit/secrets.toml` (gitignored).
+
+### Deploy ✅ — https://data-science-library.streamlit.app
+- Repo: **github.com/MWPerrineJr/datascience-rag** (`.gitignore`, `app.py`, `rag.py`, `requirements.txt`, `tests/`). Notebook checked for secrets (none); not yet committed there.
+- `requirements.txt` pinned: streamlit 1.60.0, langchain-core 1.0.4, langchain-openai 1.0.2, supabase 2.33.0, pydantic 2.11.10, python-dotenv 1.2.1.
+- **First deploy failed:** Community Cloud defaulted to **Python 3.14**; `pydantic 2.11.10` → `pydantic-core 2.33.2` has no 3.14 wheel, and building from source fails (PyO3 max 3.13). Fix: delete the app and redeploy with **Python 3.12** under Advanced settings (the version can't be changed on an existing app; secrets must be re-entered).
+
+### PR to the course ✅
+- Ed's rules (`guides/03_git_and_github.ipynb`): only community-contributions, outputs cleared, < 2,000 lines, no unnecessary tests / wordy README / .env.example / emojis.
+- `week5/community-contributions/michael_perrine_datascience_rag/`: notebook (outputs cleared), `rag.py`, `app.py`, `requirements.txt`, short `README.md`. 1 commit, 5 files, "Able to merge".
+- Made in a **git worktree** (`../llm_engineering-pr`, branch `week5-michael-perrine-ds-rag` from `upstream/main`) so the main course folder (uncommitted changes, tracked `datascience_rag/`) was untouched. Pushed to fork `MWPerrineJr/llm_engineering-1`, PR into `ed-donner/llm_engineering:main`.
+- `nbconvert` isn't installed in the venv; outputs were cleared with a stdlib `json` script.
+
+**Lessons**
+- Check a platform's default runtime before deploying pinned dependencies. Pins protect you only on the Python version they were tested on.
+- Never switch branches in a working folder with uncommitted, branch-specific files; use `git worktree`.
+- A fork's "Contribute" button opens a PR from the fork's main (here: 15 unrelated commits). Use the feature-branch banner instead.
+
+### Open items (supersedes the lists above)
+- [ ] Watch the course PR for review comments (keep `../llm_engineering-pr` until merged, then `git worktree remove ../llm_engineering-pr`)
+- [ ] Optional: add the notebook + parquet files to the datascience-rag repo; add `data-science-knowledge-base/` to `.gitignore`
+- [ ] README for the datascience-rag repo (portfolio)
+- [ ] Notebook parity cell: `rag.ask` vs notebook `ask` on 5 eval questions (compare refused_by + library/section), then replace the RAG chain cell with `from rag import ...`
+- [ ] Re-run the two-layer refusal cell on the 57-question set
+- [ ] GitHub Actions: run the unit tests on every push
+- [ ] Dedicated, budget-capped OpenAI project key for the deployed app
+- [ ] More near-miss out-of-scope questions; optional prompt tightening against outside knowledge; follow-up question memory (query rewriting)
